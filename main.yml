@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 instance with SG, IAM role, InstanceProfile, and Node.js app deployment.
+
+Parameters:
+  EC2InstanceType:
+    Type: String
+    Default: t2.micro
+
+  EC2AMI:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Internal Security group for ${AWS::StackName}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  InstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - Ref: InstanceRole
+
+  Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+        Count: 1
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              wget: []
+              unzip: []
+
+    Properties:
+      ImageId: !Ref EC2AMI
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      Monitoring: true
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > /tmp/userdata.log 2>&1
+
+          # 1. Update OS and Install Tools
+          yum -y update
+          yum install -y aws-cfn-bootstrap
+
+          # 2. Run cfn-init
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance
+
+          cat > /tmp/install_script.sh << 'EOF'
+          # START
+          echo "Setting up NodeJS Environment"
+          
+          # Install NVM
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
+          . /home/ec2-user/.nvm/nvm.sh
+          
+          # Install Node
+          nvm install 16
+          nvm use 16
+          
+          # Create App Directory
+          mkdir -p /home/ec2-user/app/logs
+          cd /home/ec2-user/app
+
+          # --- FIX: Create server.js directly (Bypasses GitHub issues) ---
+          cat > server.js << 'JSCODE'
+          const http = require('http');
+          const port = 8080;
+          const server = http.createServer((req, res) => {
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'text/plain');
+            res.end('Hello World from AWS\n');
+          });
+          // Binding to 0.0.0.0 is required for EC2 external access
+          server.listen(port, '0.0.0.0', () => {
+            console.log('Server running on port ' + port);
+          });
+          JSCODE
+
+          # --- FIX: Run in background (Prevents hanging) ---
+          # We use nohup so the server stays alive after this script exits
+          nohup node server.js > logs/app.log 2>&1 &
+          
+          EOF
+
+          # Run the setup as ec2-user
+          chown ec2-user:ec2-user /tmp/install_script.sh && chmod a+x /tmp/install_script.sh
+          su - ec2-user -c "/tmp/install_script.sh"
+
+          # Signal Success to CloudFormation
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance
+
+Outputs:
+  InstanceEndpoint:
+    Description: The DNS name for the created instance
+    Value: !Sub "http://${Instance.PublicDnsName}:8080"
+    Export:
+      Name: InstanceEndpoint
